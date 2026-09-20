@@ -411,8 +411,15 @@ elif page == "📖 Book Library":
             pr = st.number_input("Pages Read", min_value=0.0, value=float(current["pages_read"] or 0), step=1.0)
             save = st.form_submit_button("Save Book")
             if save:
-                if status == "Completed" and not fr:
-                    fr = date.today().isoformat()
+                # Finish Date is optional while a book is still being read.
+                # MySQL DATE columns do not accept an empty string, so store
+                # NULL until the book is actually completed.
+                fr = fr.strip() if isinstance(fr, str) else fr
+                if status == "Completed":
+                    fr = fr or date.today().isoformat()
+                else:
+                    fr = fr or None
+
                 execute("""UPDATE books SET title=%s,author=%s,category=%s,total_pages=%s,start_date=%s,
                            status=%s,finish_date=%s,pages_read=%s WHERE book_id=%s""",
                         (stt,auth,cat,tp,sd,status,fr,pr,selected))
