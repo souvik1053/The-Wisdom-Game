@@ -1,38 +1,108 @@
 
 import streamlit as st
-import sqlite3
+import mysql.connector
 import pandas as pd
 from datetime import date, datetime
 import calendar
 import os
+from decimal import Decimal
 
 st.set_page_config(page_title="The Wisdom Game", page_icon="📚", layout="wide")
 
-DB = os.path.join(os.path.dirname(__file__), "wisdom_game.db")
+# ============================================================
+# MYSQL CONFIGURATION
+# ============================================================
+# Local development:
+#   set MYSQL_HOST=localhost
+#   set MYSQL_PORT=3306
+#   set MYSQL_USER=root
+#   set MYSQL_PASSWORD=your_password
+#   set MYSQL_DATABASE=trader_quest
+#
+# Streamlit Cloud:
+# Add the same values to .streamlit/secrets.toml:
+#
+# [mysql]
+# host = "your-host"
+# port = 3306
+# user = "your-user"
+# password = "your-password"
+# database = "your-database"
+#
+# The app checks Streamlit secrets first, then environment variables.
+
+def _mysql_config():
+    try:
+        if "mysql" in st.secrets:
+            cfg = st.secrets["mysql"]
+            return {
+                "host": cfg.get("host", "localhost"),
+                "port": int(cfg.get("port", 3306)),
+                "user": cfg.get("user", "root"),
+                "password": cfg.get("password", ""),
+                "database": cfg.get("database", "trader_quest"),
+            }
+    except Exception:
+        pass
+
+    return {
+        "host": os.getenv("MYSQL_HOST", "localhost"),
+        "port": int(os.getenv("MYSQL_PORT", "3306")),
+        "user": os.getenv("MYSQL_USER", "root"),
+        "password": os.getenv("MYSQL_PASSWORD", ""),
+        "database": os.getenv("MYSQL_DATABASE", "trader_quest"),
+    }
+
 
 def get_conn():
-    return sqlite3.connect(DB, check_same_thread=False)
+    return mysql.connector.connect(**_mysql_config())
+
 
 def q(sql, params=()):
+    """Run a SELECT query and return a pandas DataFrame."""
     conn = get_conn()
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    return df
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        columns = [desc[0] for desc in cur.description] if cur.description else []
+        df = pd.DataFrame(rows, columns=columns)
+        # MySQL DECIMAL columns are returned as Decimal objects. Streamlit and
+        # some pandas operations expect native int/float values, so normalize
+        # Decimal values at the database boundary.
+        for col in df.columns:
+            if df[col].dtype == object and df[col].map(lambda v: isinstance(v, Decimal)).any():
+                df[col] = df[col].map(lambda v: float(v) if isinstance(v, Decimal) else v)
+        return df
+    finally:
+        cur.close()
+        conn.close()
+
 
 def execute(sql, params=()):
+    """Run INSERT/UPDATE/DELETE and commit the transaction."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(sql, params)
-    conn.commit()
-    conn.close()
+    try:
+        cur.execute(sql, params)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
 
 def scalar(sql, params=()):
+    """Return the first column of the first row."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(sql, params)
-    v = cur.fetchone()[0]
-    conn.close()
-    return v
+    try:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        value = row[0] if row else 0
+        return float(value) if isinstance(value, Decimal) else value
+    finally:
+        cur.close()
+        conn.close()
 
 def month_start(d):
     return d.replace(day=1)
@@ -42,21 +112,26 @@ def month_end(d):
     return d.replace(day=last)
 
 def fmt_pct(x):
-    return f"{max(0, x)*100:.0f}%"
+    # Always return a native float so Streamlit never receives Decimal values.
+    x = float(x or 0)
+    return f"{max(0.0, x)*100:.0f}%"
 
 def sync_book_from_log(book_title):
     if not book_title:
         return
     conn = get_conn()
     cur = conn.cursor()
-    total = cur.execute(
-        "SELECT COALESCE(SUM(pages_read),0) FROM reading_log WHERE book=?",
+    cur.execute(
+        "SELECT COALESCE(SUM(pages_read),0) FROM reading_log WHERE book=%s",
         (book_title,)
-    ).fetchone()[0]
-    row = cur.execute(
-        "SELECT total_pages,start_date,status FROM books WHERE title=? ORDER BY book_id LIMIT 1",
+    )
+    total = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT total_pages,start_date,status FROM books WHERE title=%s ORDER BY book_id LIMIT 1",
         (book_title,)
-    ).fetchone()
+    )
+    row = cur.fetchone()
     if row:
         total_pages, start_date, old_status = row
         status = old_status
@@ -67,7 +142,7 @@ def sync_book_from_log(book_title):
         elif total > 0 and old_status == "Not Started":
             status = "Reading"
         cur.execute(
-            "UPDATE books SET pages_read=?, status=?, finish_date=COALESCE(?,finish_date) WHERE title=?",
+            "UPDATE books SET pages_read=%s, status=%s, finish_date=COALESCE(%s,finish_date) WHERE title=%s",
             (total, status, finish, book_title)
         )
     conn.commit()
@@ -114,14 +189,14 @@ def monthly_stats(target):
     start = month_start(target)
     end = month_end(target)
     books_goal, pages_goal, xp_goal = q(
-        "SELECT books_goal,pages_goal,xp_goal FROM monthly_goals WHERE target_month=?",
+        "SELECT books_goal,pages_goal,xp_goal FROM monthly_goals WHERE target_month=%s",
         (start.isoformat(),)
-    ).iloc[0].tolist() if not q("SELECT 1 FROM monthly_goals WHERE target_month=?",(start.isoformat(),)).empty else (0,0,0)
+    ).iloc[0].tolist() if not q("SELECT 1 FROM monthly_goals WHERE target_month=%s",(start.isoformat(),)).empty else (0,0,0)
     completed = scalar("""SELECT COUNT(*) FROM books
-                         WHERE status='Completed' AND finish_date>=? AND finish_date<?""",
+                         WHERE status='Completed' AND finish_date>=%s AND finish_date<%s""",
                        (start.isoformat(), (end + pd.Timedelta(days=1)).isoformat()))
     pages = scalar("""SELECT COALESCE(SUM(pages_read),0) FROM reading_log
-                      WHERE date>=? AND date<?""",
+                      WHERE date>=%s AND date<%s""",
                    (start.isoformat(), (end + pd.Timedelta(days=1)).isoformat()))
     xp = pages * 2
     book_pct = completed/books_goal if books_goal else 0
@@ -217,7 +292,7 @@ if page == "🏠 Dashboard":
     with a: st.markdown(f'<div class="panel"><div class="eyebrow">LEVEL</div><div class="rank">LVL {lvl}</div><div class="badge">{title}</div></div>',unsafe_allow_html=True)
     with b:
         st.markdown('<div class="panel"><div class="eyebrow">NEXT LEVEL</div>',unsafe_allow_html=True)
-        nxt=q("SELECT xp FROM levels WHERE level=?",(lvl+1,))
+        nxt=q("SELECT xp FROM levels WHERE level=%s",(lvl+1,))
         nx=float(nxt["xp"].iloc[0]) if not nxt.empty else lvl_base+1000
         st.progress(min(1,max(0,xp_into/max(1,nx-lvl_base))),text=f"{int(xp_into):,} XP toward Level {lvl+1}")
         st.markdown(f'<div class="small">{max(0,int(nx-total_xp)):,} XP remaining</div></div>',unsafe_allow_html=True)
@@ -230,9 +305,9 @@ if page == "🏠 Dashboard":
     q3.metric("XP", f"{int(lm['xp'])} / {int(lm['xp_goal'])}")
     q4.metric("Days Left", int(lm["days_left"]))
 
-    st.progress(min(1.0, lm["page_pct"]), text=f"📄 Pages — {fmt_pct(lm['page_pct'])}")
-    st.progress(min(1.0, lm["book_pct"]), text=f"📚 Books — {fmt_pct(lm['book_pct'])}")
-    st.progress(min(1.0, lm["xp_pct"]), text=f"⚡ XP — {fmt_pct(lm['xp_pct'])}")
+    st.progress(float(min(1.0, float(lm["page_pct"]))), text=f"📄 Pages — {fmt_pct(lm['page_pct'])}")
+    st.progress(float(min(1.0, float(lm["book_pct"]))), text=f"📚 Books — {fmt_pct(lm['book_pct'])}")
+    st.progress(float(min(1.0, float(lm["xp_pct"]))), text=f"⚡ XP — {fmt_pct(lm['xp_pct'])}")
 
     pace1,pace2,pace3 = st.columns(3)
     pace1.metric("Pages/day so far", f"{lm['page_pace']:.1f}")
@@ -268,18 +343,19 @@ if page == "🏠 Dashboard":
 elif page == "⚔️ Daily Quest":
     st.title("⚔️ Daily Quest")
     today=date.today()
-    pages_today=scalar("SELECT COALESCE(SUM(pages_read),0) FROM reading_log WHERE date=?",(today.isoformat(),))
+    pages_today=scalar("SELECT COALESCE(SUM(pages_read),0) FROM reading_log WHERE date=%s",(today.isoformat(),))
     target=20
     a,b,c,d=st.columns(4)
     a.metric("📄 Target",f"{target} pages"); b.metric("📖 Read",f"{int(pages_today)} pages")
     c.metric("🔥 Streak",f"{current_streak()} days"); d.metric("🎁 Bonus","+50 XP" if pages_today>=target else "Locked")
-    st.progress(min(1,pages_today/target),text=f"Daily Quest: {int(pages_today)} / {target} pages")
+    daily_progress = min(1.0, float(pages_today) / float(target))
+    st.progress(daily_progress, text=f"Daily Quest: {int(pages_today)} / {target} pages")
     if pages_today>=target: st.success("⚔️ DAILY QUEST COMPLETE!")
     else: st.warning(f"Read {max(0,target-pages_today):.0f} more pages.")
     st.markdown("### 🗡️ Missions")
     for name,done,reward in [
         ("📖 Read 20 pages",pages_today>=20,"+50 XP"),
-        ("🧠 Capture one lesson",scalar("SELECT COUNT(*) FROM reading_log WHERE date=? AND notes<>''",(today.isoformat(),))>0,"+20 XP"),
+        ("🧠 Capture one lesson",scalar("SELECT COUNT(*) FROM reading_log WHERE date=%s AND notes<>''",(today.isoformat(),))>0,"+20 XP"),
         ("🔥 Protect your streak",pages_today>0,"+10 XP")]:
         st.markdown(f'<div class="quest"><span class="quest-title">{"✅" if done else "⬜"} {name}</span><span class="badge" style="float:right">{reward}</span></div>',unsafe_allow_html=True)
     st.markdown(f'<div class="quote">💎 You have <b>{wisdom_coins():,} Wisdom Coins</b>.</div>',unsafe_allow_html=True)
@@ -300,7 +376,7 @@ elif page == "📖 Book Library":
         if submitted and title_in.strip():
             next_id = int(scalar("SELECT COALESCE(MAX(book_id),0)+1 FROM books"))
             execute("""INSERT INTO books(book_id,title,author,category,total_pages,start_date,status,pages_read)
-                       VALUES (?,?,?,?,?,?,?,0)""",
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,0)""",
                     (next_id,title_in.strip(),author_in.strip(),category_in.strip(),pages_in,start_in.isoformat(),"Not Started"))
             st.success("Book added.")
             st.rerun()
@@ -322,7 +398,7 @@ elif page == "📖 Book Library":
     if not ids.empty:
         selected = st.selectbox("Book", ids["book_id"].tolist(),
                                 format_func=lambda x: f"{x} — {ids.loc[ids.book_id==x,'title'].iloc[0]}")
-        current = q("SELECT * FROM books WHERE book_id=?",(selected,)).iloc[0]
+        current = q("SELECT * FROM books WHERE book_id=%s",(selected,)).iloc[0]
         with st.form("edit_book"):
             stt = st.text_input("Title", current["title"])
             auth = st.text_input("Author", current["author"] or "")
@@ -337,8 +413,8 @@ elif page == "📖 Book Library":
             if save:
                 if status == "Completed" and not fr:
                     fr = date.today().isoformat()
-                execute("""UPDATE books SET title=?,author=?,category=?,total_pages=?,start_date=?,
-                           status=?,finish_date=?,pages_read=? WHERE book_id=?""",
+                execute("""UPDATE books SET title=%s,author=%s,category=%s,total_pages=%s,start_date=%s,
+                           status=%s,finish_date=%s,pages_read=%s WHERE book_id=%s""",
                         (stt,auth,cat,tp,sd,status,fr,pr,selected))
                 st.success("Book updated.")
                 st.rerun()
@@ -366,7 +442,7 @@ elif page == "📝 Reading Log":
         save = st.form_submit_button("📖 Log Reading")
         if save:
             execute("""INSERT INTO reading_log(date,book,category,pages_from,pages_read,session_type,notes)
-                       VALUES (?,?,?,?,?,?,?)""",
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                     (dt.isoformat(),book,category,pages_from,pages_read,session_type,notes))
             sync_book_from_log(book)
             st.success(f"+{pages_read*2:.0f} XP earned. Monthly progress updated automatically.")
@@ -449,9 +525,11 @@ elif page == "🎯 Monthly Quest":
         save = st.form_submit_button("Save Monthly Goal")
         if save:
             execute("""INSERT INTO monthly_goals(target_month,books_goal,pages_goal,xp_goal)
-                       VALUES (?,?,?,?)
-                       ON CONFLICT(target_month) DO UPDATE SET books_goal=excluded.books_goal,
-                       pages_goal=excluded.pages_goal,xp_goal=excluded.xp_goal""",
+                       VALUES (%s,%s,%s,%s)
+                       ON DUPLICATE KEY UPDATE
+                       books_goal=VALUES(books_goal),
+                       pages_goal=VALUES(pages_goal),
+                       xp_goal=VALUES(xp_goal)""",
                     (target.isoformat(),bg,pg,pg*2))
             st.success("Monthly quest saved.")
             st.rerun()
@@ -466,9 +544,9 @@ elif page == "🎯 Monthly Quest":
     c.metric("XP", f"{int(live['xp'])} / {int(live['xp_goal'])}")
     d.metric("Overall", fmt_pct(live["overall"]))
 
-    st.progress(min(1.0, live["book_pct"]), text=f"Books: {fmt_pct(live['book_pct'])}")
-    st.progress(min(1.0, live["page_pct"]), text=f"Pages: {fmt_pct(live['page_pct'])}")
-    st.progress(min(1.0, live["xp_pct"]), text=f"XP: {fmt_pct(live['xp_pct'])}")
+    st.progress(float(min(1.0, float(live["book_pct"]))), text=f"Books: {fmt_pct(live['book_pct'])}")
+    st.progress(float(min(1.0, float(live["page_pct"]))), text=f"Pages: {fmt_pct(live['page_pct'])}")
+    st.progress(float(min(1.0, float(live["xp_pct"]))), text=f"XP: {fmt_pct(live['xp_pct'])}")
 
     if selected_month.year == date.today().year and selected_month.month == date.today().month:
         st.info(f"📅 {live['days_left']} days left • {live['required_daily_pages']:.0f} pages/day needed from now")
